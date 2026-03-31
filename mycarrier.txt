@@ -1,0 +1,3 @@
+dev-customer.mycarrier.co.id
+neucentrix.mycarrier.co.id
+status.mycarrier.co.id
