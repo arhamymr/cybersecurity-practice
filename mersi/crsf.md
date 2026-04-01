@@ -21,3 +21,6 @@ Ciri website vulnerable CSRF
     - Origin / referer
 - Tidak pakai SameSite cookie 
 
+
+Cara mencegah CSRF 
+
