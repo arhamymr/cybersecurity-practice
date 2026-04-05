@@ -24,6 +24,6 @@ Scan yang digunakan hacker
 
 nmap -sS 192.168.1.1 = Stealth scan, tidak full connect 
 nmap -sU 192.168.1.1 = UDP Scan, untuk service seperti DNS, SNMP
-
+nmap -sT 192.168.1.1 = TCP Scan, full handshake connection
 
 
