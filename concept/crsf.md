@@ -24,8 +24,15 @@ Ciri website vulnerable CSRF
 ## Cara mencegah CSRF 
 
 - CSRF Token 
+  
+  - Server generate token (random)
+  - token disimpan di server (bisa di simpan di session)
+  - Token dikirim ke client (form/header)
+  - Server validasi token saat request masuk
 
 - SameSite Cookie 
+
+
 - Validasi Origin / Referer Header
 - Jangan gunakan untuk Aksi sensitif 
 - Double Submit Cookie
