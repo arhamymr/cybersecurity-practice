@@ -24,8 +24,6 @@ Ciri website vulnerable CSRF
 ## Cara mencegah CSRF 
 
 - CSRF Token 
-  
-  
 
 - SameSite Cookie 
 - Validasi Origin / Referer Header

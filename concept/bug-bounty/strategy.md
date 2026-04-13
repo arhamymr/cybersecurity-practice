@@ -1,4 +1,6 @@
-# STRATEGY 1
+# STRATEGY
+
+## STRATEGI 1
 
 Set goals dulu, exploit belakangan 
 
@@ -8,7 +10,7 @@ Set goals dulu, exploit belakangan
 - Test "Bagaimana cara membuktikan asumsi ini ?"
 - Result "Bagaimana hasilnya? jika gagal, kembali ke asumsi, kembangkan ulang dan explorasi lagi"
   
-# STRATEGI 2 
+## STRATEGI 2 
 
 Hindari metodologi pentest, fokus goals 
 
@@ -17,7 +19,7 @@ Hindari metodologi pentest, fokus goals
 
 jika menggunakan metodologi pentest akan sulit mendapatkan celah, fokus di goals yang ada di strategy 1 
 
-# STRATEGI 3 
+## STRATEGI 3 
 
 Coba serang logic-nya, bukan aplikasinya 
 
