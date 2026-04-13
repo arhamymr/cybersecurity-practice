@@ -13,17 +13,24 @@ Biasanya digunakan untuk
 
 Command 
 
-nmap 192.168.1.1 = Scan 1000 port paling umum 
-nmap -p 80,443 192.168.1.1 = Scan spesifik port 80 dan 443 
-nmap -p- 192.168.1.1 = Scan semua port 
-nmap -sV 192.168.1.1 = Service detection, scan versi service seperti misal Apache 2.4.49
-nmap -O 192.168.1.1 = OS Detection
-nmap -A 192.168.1.1 = Aggresive scan, sering digunakan pentester 
+- nmap 192.168.1.1 = Scan 1000 port paling umum 
+- nmap -p 80,443 192.168.1.1 = Scan spesifik port 80 dan 443 
+- nmap -p- 192.168.1.1 = Scan semua port 
+- nmap -sV 192.168.1.1 = Service detection, scan versi service seperti misal Apache 2.4.49
+- nmap -O 192.168.1.1 = OS Detection
+- nmap -A 192.168.1.1 = Aggresive scan, sering digunakan pentester 
 
 Scan yang digunakan hacker 
 
-nmap -sS 192.168.1.1 = Stealth scan, tidak full connect 
-nmap -sU 192.168.1.1 = UDP Scan, untuk service seperti DNS, SNMP
-nmap -sT 192.168.1.1 = TCP Scan, full handshake connection
+- nmap -sS 192.168.1.1 = Stealth scan, tidak full connect 
+- nmap -sU 192.168.1.1 = UDP Scan, untuk service seperti DNS, SNMP
+- nmap -sT 192.168.1.1 = TCP Scan, full handshake connection
 
+NSE (Nmap Script Engine) adalah fitur Nmap yang menmungkinkan kamu menjalankan script otomatis untuk memperluas kemampuan scanning
 
+Run NSE Scripts 
+
+- nmap --script=vuln 192.168.1.1
+- nmap --script=http-title 192.168.1.1
+- nmap --script=ftp-brute 192.168.1.1
+- 

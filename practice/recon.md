@@ -13,7 +13,4 @@ apsaradigital.com:80
 
 found 4 open port
 
-Scan using nmap -sC -V apsaradigital.com
-
-
-
+Scan using nmap -sC -sV apsaradigital.com
