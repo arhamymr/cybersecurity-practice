@@ -1,4 +1,4 @@
-#CRSF (CROSS-SITE REQUEST FORGERY)
+# CRSF (CROSS-SITE REQUEST FORGERY)
 
 Serangan yang memaksa user yang sedang login untuk melakukan aksi tanpa sadar di suatu website 
 
@@ -21,7 +21,20 @@ Ciri website vulnerable CSRF
     - Origin / referer
 - Tidak pakai SameSite cookie 
 
+## Cara mencegah CSRF 
 
-Cara mencegah CSRF 
-- 
+- CSRF Token 
+  
+  
+
+- SameSite Cookie 
+- Validasi Origin / Referer Header
+- Jangan gunakan untuk Aksi sensitif 
+- Double Submit Cookie
+- Gunakan Framework Protection (Built-in CSRF Protection)
+- Gunakan Header khusus
+- Reauthentication untuk aksi kritis 
+  
+
+
 

@@ -20,7 +20,7 @@ Macam macam XSS
    
    Contohnya:
 
-   ```(https://example.com/search?q=<script>alert(1)</script>)```
+   `(https://example.com/search?q=<script>alert(1)</script>)`
 
    jika server tidak sanitize -> script langsung jalan
   
