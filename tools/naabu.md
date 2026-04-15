@@ -1,2 +1,3 @@
 # NAABU
 
+naabu example
