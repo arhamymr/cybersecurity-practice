@@ -1,0 +1,21 @@
+{
+  "name": "otp-brute-force",
+  "version": "1.0.0",
+  "description": "OTP Brute Force Tool for Cybersecurity Practice",
+  "main": "otp-brute-force.js",
+  "scripts": {
+    "start": "node otp-brute-force.js"
+  },
+  "keywords": [
+    "security",
+    "brute-force",
+    "cybersecurity",
+    "educational"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^16.6.1"
+  }
+}

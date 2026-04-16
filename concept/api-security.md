@@ -140,3 +140,6 @@ User bisa jadi **Admin**
 
 
 ## UNRESTRICTED RESOURCE CONSUPTION
+
+Kerentanan ketika aplikasi tidak membatasi penggunaan resource (CPU, RAM, Bandwith, disk, atau API Calls), sehingga attacker bisa "menguras" resource sampai sistem jadi lambat atau bahkan down
+
