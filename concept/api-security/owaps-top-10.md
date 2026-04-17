@@ -1,5 +1,15 @@
 # API SECURITY 
 
+## Table of Contents
+
+- [Broken Object Level Authorization (BOLA)](#broken-object-level-authorization-bola)
+- [Broken Authentication](#broken-authentication)
+- [Broken Object Property Level Authorization (BOPLA)](#broken-object-propery-level-authorization-bopla)
+- [Unrestricted Resource Consumption](#unrestricted-resource-consuption)
+- [Unrestricted Access to Sensitive Business Flows](#unrestricted-access-to-sensitive-business-flows)
+
+
+
 OWASP API Security Top 10 
 
 ## BROKEN OBJECT LEVEL AUTHORIZATION (BOLA)
@@ -176,5 +186,59 @@ Contohnya e-commerce yang memiliki fitur refund uang, namun karena ada bug user 
 - **Validasi dan Authorization Backend**
   
   Validasi setiap request dan lakukan pengecekan authorization setiap request 
+
+
+## SERVER SIDE REQUEST FORGERY
+
+Kerentanan dimana server aplikasi bisa dipaksa untuk mengirim request ke lokasi lain yang seharusnya tidak boleh diakses oleh user 
+
+Biasanya aplikasi selalu punya fitur seperti fetch URL, import file dari URL dan Webhook / callback, kalau input URL dari user tidak di validasi dengan baik attacker bisa mengubah URL tersebut 
+
+Contoh sederhana 
+
+Aplikasi
+
+`GET /fetch?url=https://example.com/data`
+
+Attacker bisa mengubah jadi 
+
+`GET /fetch?url=http://localhost/admin`
+
+Server akan request ke dirinya sendiri (localhost), padahal ketika akses dari luar kita tidak bisa mengakses localhost, jadi semacam relay yang menhubungkan ke internal services
+
+### Cara Mencegah 
+
+- **Validasi URL** gunakan allow list (domain yang boleh saja) dan hindari blacklist 
+- **Block IP internal** tolak request ke 127.0.0.1, 169.254.169.254 (alamat khusus biasanya metadata server), Private IP (10.x.x.x, 192.168.x.x)
+- **Gunakan Network Firewall** batasi server agak tidak bisa akses Internal service tertentu dan Metadata endpoint jika tidak diperlukan
+- **Gunakan Proxy / Gateway** 
+Semua outbound request lewat kontrol 
+
+## SERVER MISCONFIGURATION
+
+Kesalahan setting yang membuat endpoint API menjadi terlalu terbuka, contoh:
+- Tidak ada Rate Limit
+- Patch Keamanan belum diperbarui
+- misconfigurasi pada api response api terlalu detail 
+
+  ```
+  {
+    "error": "SQL error",
+    "trace": "...",
+    "db_user": "root"
+  }
+  ```
+  bocor informasi sensitif
+- CORS salah configurasi
+```
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Credentials: true
+```
+Website lain bisa akses API pakai session user
+- Endpoint Internal terbuka 
+  - /api/admin
+  - /api/debug
+  - /api/test
+  tidak ada Authentication
 
 
