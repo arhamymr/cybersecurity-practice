@@ -1,0 +1,885 @@
+/**
+ * WebSec Scanner - Browser-based Security Scanner
+ * 
+ * This script scans web applications for security issues including:
+ * - Exposed secrets/API keys
+ * - XSS vulnerabilities
+ * - Sensitive endpoints
+ * - Security misconfigurations
+ * 
+ * Usage: Paste this script into browser console or save as bookmarklet
+ */
+
+(async function WebSecScanner() {
+  'use strict';
+
+  var CFG = {
+    INCLUDE_DEPTH    : 5,      // BFS max depth
+    INCLUDE_LIMIT    : 0,      // 0 = unlimited (visited-set is dedup guard)
+    BFS_BRAKE        : 2000,   // emergency absolute cap (safety net, not normal limit)
+    FETCH_CONCUR     : 6,      // max parallel fetches
+    FETCH_TIMEOUT_MS : 15000,  // per-request abort timeout
+    DYN_IDLE_MS      : 500,    // ms of network silence = "idle"
+    DYN_MAX_MS       : 8000,   // hard ceiling on dynamic capture wait
+    DYN_MIN_MS       : 1500,   // minimum wait before idle check
+  };
+
+  if (window.__wsPatchActive) {
+    console.warn('[WebSecScanner] Patches already active. Restoring before re-run.');
+    window.__wsRestore && window.__wsRestore();
+  }
+
+  var _live        = [];
+  var _origFetch   = window.fetch.bind(window);
+  var _origXHROpen = XMLHttpRequest.prototype.open;
+  var _origXHRSend = XMLHttpRequest.prototype.send;
+
+  window.fetch = async function _wsFetch(input, init) {
+    init = init || {};
+    var url    = (input instanceof Request) ? input.url : String(input);
+    var method = (init.method || (input instanceof Request ? input.method : '') || 'GET').toUpperCase();
+    var body   = null;
+    try { if (init.body) body = typeof init.body === 'string' ? init.body.substring(0, 600) : '[binary]'; } catch {}
+    _live.push({ via:'fetch', url:url, method:method, body:body, ts:new Date().toISOString() });
+    return _origFetch(input, init);
+  };
+
+  XMLHttpRequest.prototype.open = function(method, url) {
+    this._wsM = (method || 'GET').toUpperCase();
+    this._wsU = String(url);
+    return _origXHROpen.apply(this, arguments);
+  };
+
+  XMLHttpRequest.prototype.send = function(body) {
+    _live.push({ via:'xhr', url:this._wsU, method:this._wsM,
+      body: body ? String(body).substring(0, 600) : null, ts: new Date().toISOString() });
+    return _origXHRSend.apply(this, arguments);
+  };
+
+  window.__wsPatchActive = true;
+  window.__wsRestore = function() {
+    window.fetch                  = _origFetch;
+    XMLHttpRequest.prototype.open = _origXHROpen;
+    XMLHttpRequest.prototype.send = _origXHRSend;
+    window.__wsPatchActive        = false;
+    console.log('[WebSecScanner] Monkey-patches restored.');
+  };
+
+  var SECRET_PATTERNS = [
+    { name:'AWS Access Key ID',           sev:'CRITICAL', score:40, rx:/\b(AKIA[0-9A-Z]{16})\b/g },
+    { name:'AWS Secret Key',              sev:'CRITICAL', score:40, rx:/(?:aws_secret|aws[\-_]secret[\-_](?:access[\-_])?key)\s*[:=]\s*['"]?([A-Za-z0-9\/+=]{40})['"]?/gi },
+    { name:'Private Key Header',          sev:'CRITICAL', score:40, rx:/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g },
+    { name:'MongoDB URI (with creds)',    sev:'CRITICAL', score:40, rx:/mongodb(?:\+srv)?:\/\/[^:@\s]+:[^@\s]+@[^\s"'<>]+/gi },
+    { name:'PostgreSQL URI (with creds)', sev:'CRITICAL', score:40, rx:/postgres(?:ql)?:\/\/[^:@\s]+:[^@\s]+@[^\s"'<>]+/gi },
+    { name:'MySQL URI (with creds)',      sev:'CRITICAL', score:40, rx:/mysql:\/\/[a-z0-9._%+\-]+:[^\s:@]+@(?:\[[0-9a-f:.]+\]|[a-z0-9.\-]+)(?::\d{2,5})?(?:\/[^\s"'?:]+)?/gi },
+    { name:'Database URL (generic creds)',sev:'CRITICAL', score:40, rx:/(?:redis|mssql|oracle):\/\/[^:@\s]+:[^@\s]+@[^\s"'<>]{4,}/gi },
+    { name:'Stripe Live Secret Key',      sev:'HIGH', score:20, rx:/\b(sk_live_[0-9a-zA-Z]{24,})\b/g },
+    { name:'Google API Key',              sev:'HIGH', score:20, rx:/\b(AIza[0-9A-Za-z\-_]{35})\b/g },
+    { name:'Google OAuth2 Access Token',  sev:'HIGH', score:20, rx:/\b(ya29\.[a-z0-9_\-]{30,})\b/gi },
+    { name:'Firebase API Key',            sev:'HIGH', score:20, rx:/apiKey\s*:\s*['"](AIza[0-9A-Za-z\-_]{35})['"]/g },
+    { name:'JWT',                         sev:'HIGH', score:20, rx:/\b(eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]+)\b/g },
+    { name:'Bearer / Auth Token',         sev:'HIGH', score:20, rx:/(?:Authorization|Bearer)\s*[:=]\s*['"]?Bearer\s+([A-Za-z0-9\-._~+\/]+=*)/gi },
+    { name:'GitHub Personal Token',       sev:'HIGH', score:20, rx:/\b(ghp_[0-9a-zA-Z]{36})\b/g },
+    { name:'GitHub Token (generic)',      sev:'HIGH', score:20, rx:/\b(gh[pousr]_[A-Za-z0-9_]{36,255})\b/g },
+    { name:'GitLab Token',                sev:'HIGH', score:20, rx:/\b(glpat-[0-9a-zA-Z\-_]{20})\b/g },
+    { name:'Slack Bot Token',             sev:'HIGH', score:20, rx:/\b(xox[baprs]-[0-9A-Za-z\-]{10,48})\b/g },
+    { name:'SendGrid API Key',            sev:'HIGH', score:20, rx:/\b(SG\.[\w\d\-_]{22}\.[\w\d\-_]{43})\b/g },
+    { name:'Telegram Bot Token',          sev:'HIGH', score:20, rx:/\d{9}:[a-zA-Z0-9_\-]{35}/g },
+    { name:'DigitalOcean Token',          sev:'HIGH', score:20, rx:/\bdop_v1_[a-z0-9]{64}\b/g },
+    { name:'Facebook Access Token',       sev:'HIGH', score:20, rx:/\b(EAACEdEose0cBA[A-Z0-9]{20,})\b/g },
+    { name:'Cloudflare Service Key',      sev:'HIGH', score:20, rx:/(?:cloudflare|x-auth-user-service-key).{0,64}(v1\.0-[a-z0-9._\-]{160,})\b/gi },
+    { name:'NPM Token',                   sev:'HIGH', score:20, rx:/\bnpm_[A-Za-z0-9]{36}\b/g },
+    { name:'Stripe Publishable Key',      sev:'MEDIUM', score:10, rx:/\b(pk_(?:live|test)_[0-9a-zA-Z]{24,})\b/g },
+    { name:'Stripe Test Secret Key',      sev:'MEDIUM', score:10, rx:/\b(sk_test_[0-9a-zA-Z]{24,})\b/g },
+    { name:'Firebase DB URL',             sev:'MEDIUM', score:10, rx:/https?:\/\/[a-zA-Z0-9\-]+\.firebaseio\.com/g },
+    { name:'Cloudinary URL',              sev:'MEDIUM', score:10, rx:/cloudinary:\/\/[0-9]+:[A-Za-z0-9_\-]+@[a-z0-9]+/g },
+    { name:'Mapbox Token',                sev:'MEDIUM', score:10, rx:/\b(pk\.eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+)\b/g },
+    { name:'Twilio Account SID',          sev:'MEDIUM', score:10, rx:/\b(AC[a-z0-9]{32})\b/g },
+    { name:'Twilio API Key',              sev:'MEDIUM', score:10, rx:/\b(SK[0-9a-fA-F]{32})\b/g },
+    { name:'Algolia Admin API Key',       sev:'MEDIUM', score:10, rx:/algolia.{0,32}([a-z0-9]{32})\b/gi },
+    { name:'Algolia Application ID',      sev:'MEDIUM', score:10, rx:/algolia.{0,16}([A-Z0-9]{10})\b/gi },
+    { name:'Cloudflare API Token',        sev:'MEDIUM', score:10, rx:/cloudflare.{0,32}(?:secret|private|access|key|token).{0,32}([a-z0-9_\-]{38,42})\b/gi },
+    { name:'Shopify Access Token',        sev:'MEDIUM', score:10, rx:/\bshpat_[0-9a-fA-F]{32}\b/g },
+    { name:'Linear API Key',              sev:'MEDIUM', score:10, rx:/lin_api_[a-zA-Z0-9]{40}/g },
+    { name:'Heroku API Key',              sev:'MEDIUM', score:10, rx:/[hH]eroku['"][0-9a-f]{32}['"]/g },
+    { name:'Dropbox Access Token',        sev:'MEDIUM', score:10, rx:/\bsl\.[A-Za-z0-9_\-]{20,100}\b/g },
+    { name:'Facebook App ID',             sev:'MEDIUM', score:10, rx:/(?:facebook|fb).{0,8}(?:app|application).{0,16}(\d{15})\b/gi },
+    { name:'New Relic Key',               sev:'MEDIUM', score:10, rx:/\bNRII-[a-zA-Z0-9]{20,}\b/g },
+    { name:'Generic High-Entropy Key',    sev:'LOW', score:3, rx:/(?:secret|api_?key|apikey|access_?token|auth_?token|private_?key)\s*[:=]\s*['"]([A-Za-z0-9\-_.+\/]{16,64})['"]/gi },
+  ];
+
+  function entropyThreshold(s) {
+    if (!s) return 99;
+    if (/^[0-9a-f]+$/i.test(s))        return 2.8;
+    if (/^[A-Za-z0-9+\/]+=*$/.test(s)) return 4.2;
+    if (/^[A-Za-z0-9_\-]+$/.test(s))   return 3.8;
+    return 3.5;
+  }
+
+  function shannonEntropy(s) {
+    if (!s || s.length < 8) return 0;
+    var f = {}, n = s.length;
+    for (var i = 0; i < n; i++) f[s[i]] = (f[s[i]] || 0) + 1;
+    return -Object.values(f).reduce(function(a, v) { var p = v/n; return a + p * Math.log2(p); }, 0);
+  }
+
+  function isHighEntropy(s) { return shannonEntropy(s) >= entropyThreshold(s); }
+
+  function isInComment(code, idx) {
+    var lineStart  = code.lastIndexOf('\n', idx - 1) + 1;
+    var linePrefix = code.substring(lineStart, idx);
+
+    var inStr = false, strChar = '', prev = '';
+    for (var ci = 0; ci < linePrefix.length - 1; ci++) {
+      var ch = linePrefix[ci];
+      var nx = linePrefix[ci + 1];
+      if (!inStr) {
+        if (ch === '"' || ch === "'") { inStr = true; strChar = ch; }
+        else if (ch === '/' && nx === '/' && prev !== ':') {
+          return true;
+        }
+      } else {
+        if (ch === strChar && prev !== '\\') inStr = false;
+      }
+      prev = ch;
+    }
+
+    var pre       = code.substring(Math.max(0, idx - 500), idx);
+    var lastOpen  = pre.lastIndexOf('/*');
+    var lastClose = pre.lastIndexOf('*/');
+    if (lastOpen > -1 && lastOpen > lastClose) return true;
+
+    return false;
+  }
+
+  var TAINT_SOURCES_RX = /location\.(search|hash|href|pathname)|document\.(URL|referrer|cookie)|window\.name|URLSearchParams|decodeURI|postMessage|getParameter|req\.(query|body|params)|request\.(query|body|params)|innerHTML.*=.*(?:req|input|param|user|data)/i;
+
+  function taintHint(code, idx) {
+    var window400 = code.substring(Math.max(0, idx - 400), idx + 80);
+    if (TAINT_SOURCES_RX.test(window400)) return 'tainted';
+    var rhs = code.substring(idx, idx + 120);
+    if (/=\s*["'][^"']{1,120}["']\s*[;,]/.test(rhs)) return 'static';
+    return 'unknown';
+  }
+
+  function sinkContextOk(code, idx) {
+    return !isInComment(code, idx);
+  }
+
+  var SINK_PATTERNS = [
+    { sink:'eval()',                  rx:/\beval\s*\(/g,                         risk:'CRITICAL', score:15 },
+    { sink:'new Function()',          rx:/new\s+Function\s*\(/g,                 risk:'CRITICAL', score:15 },
+    { sink:'innerHTML',               rx:/\.innerHTML\s*[+]?=/g,                 risk:'HIGH',     score:8  },
+    { sink:'outerHTML',               rx:/\.outerHTML\s*[+]?=/g,                 risk:'HIGH',     score:8  },
+    { sink:'document.write',          rx:/document\.write(?:ln)?\s*\(/g,         risk:'HIGH',     score:8  },
+    { sink:'insertAdjacentHTML',      rx:/insertAdjacentHTML\s*\(/g,             risk:'HIGH',     score:8  },
+    { sink:'setTimeout(string)',      rx:/setTimeout\s*\(\s*['"]/g,              risk:'HIGH',     score:8  },
+    { sink:'setInterval(string)',     rx:/setInterval\s*\(\s*['"]/g,             risk:'HIGH',     score:8  },
+    { sink:'element.src assign',      rx:/(?:script|img|iframe)\.src\s*=/g,      risk:'HIGH',     score:8  },
+    { sink:'dangerouslySetInnerHTML', rx:/dangerouslySetInnerHTML/g,             risk:'HIGH',     score:8  },
+    { sink:'location.href assign',    rx:/location\.href\s*=/g,                  risk:'MEDIUM',   score:3  },
+    { sink:'location.replace()',      rx:/location\.replace\s*\(/g,              risk:'MEDIUM',   score:3  },
+    { sink:'postMessage()',           rx:/\.postMessage\s*\(/g,                  risk:'MEDIUM',   score:3  },
+    { sink:'window.open()',           rx:/window\.open\s*\(/g,                   risk:'LOW',      score:1  },
+  ];
+
+  function deobfuscate(src) {
+    var out = src
+      .replace(/\\u([0-9a-fA-F]{4})/g, function(_, h) { return String.fromCharCode(parseInt(h, 16)); })
+      .replace(/\\x([0-9a-fA-F]{2})/g, function(_, h) { return String.fromCharCode(parseInt(h, 16)); })
+      .replace(/(['"])\s*\+\s*\1/g, '');
+
+    for (var pass = 0; pass < 10; pass++) {
+      var prev = out;
+      var arrPat = /\bvar\s+(_0x[0-9a-fA-F]+)\s*=\s*\[([^\]]{0,20000})\]/g, am;
+      while ((am = arrPat.exec(out)) !== null) {
+        var varName = am[1], content = am[2], entries = [];
+        var eRx = /["']([^"'\\]*(\\.[^"'\\]*)*)["']/g, em;
+        while ((em = eRx.exec(content)) !== null) entries.push(em[1]);
+        if (!entries.length) continue;
+        var refRx = new RegExp(varName.replace(/[$\\]/g, '\\$&') + '\\s*\\[\\s*(\\d+)\\s*\\]', 'g');
+        out = out.replace(refRx, function(_, idx) {
+          var i = parseInt(idx, 10);
+          return i < entries.length ? ('"' + entries[i] + '"') : _;
+        });
+      }
+      if (out === prev) break;
+    }
+
+    var scanCopy = out;
+    var b64Rx = /["']([A-Za-z0-9+\/]{20,}={0,2})["']/g, bm;
+    while ((bm = b64Rx.exec(out)) !== null) {
+      try {
+        var decoded = atob(bm[1]);
+        if (/^[\x20-\x7E]+$/.test(decoded) && decoded.length > 8) {
+          scanCopy = scanCopy.replace(bm[0], '"' + decoded.replace(/"/g, '\\"') + '"');
+        }
+      } catch {}
+    }
+
+    return { scan: scanCopy, raw: out };
+  }
+
+  function isObfuscated(code) {
+    var signals = 0;
+    var hexVarCount = (code.match(/_0x[0-9a-fA-F]+/g) || []).length;
+    if (hexVarCount / (code.length / 100) > 0.5) signals++;
+    if (/\[\]\s*\[\s*!\s*\[\s*\]/.test(code)) signals++;
+    var hasLongLine = code.split('\n').some(function(l) { return l.length > 5000; });
+    if (hasLongLine && shannonEntropy(code.substring(0, 2000)) > 5.0) signals++;
+    if (/^\s*var\s+_0x[0-9a-fA-F]+\s*=\s*\[/.test(code.substring(0, 500))) signals++;
+    return signals >= 2;
+  }
+
+  var ENDPOINT_PATTERNS = [
+    /["']((?:https?:)?\/\/[^"']+\/api\/[a-zA-Z0-9/_\-]+)['"]/gi,
+    /["'](\/api\/v?\d*\/[a-zA-Z0-9/_\-]{2,})['"]/gi,
+    /["'](\/v\d+\/[a-zA-Z0-9/_\-]{2,})['"]/gi,
+    /["'](\/rest\/[a-zA-Z0-9/_\-]{2,})['"]/gi,
+    /["'](\/graphql[a-zA-Z0-9/_\-]*)['"]/gi,
+    /["'](\/oauth[0-9]*\/[a-zA-Z0-9/_\-]+)['"]/gi,
+    /["'](\/auth[a-zA-Z0-9/_\-]*)['"]/gi,
+    /["'](\/login[a-zA-Z0-9/_\-]*)['"]/gi,
+    /["'](\/logout[a-zA-Z0-9/_\-]*)['"]/gi,
+    /["'](\/token[a-zA-Z0-9/_\-]*)['"]/gi,
+    /["'](\/admin[a-zA-Z0-9/_\-]*)['"]/gi,
+    /["'](\/dashboard[a-zA-Z0-9/_\-]*)['"]/gi,
+    /["'](\/internal[a-zA-Z0-9/_\-]*)['"]/gi,
+    /["'](\/debug[a-zA-Z0-9/_\-]*)['"]/gi,
+    /["'](\/config[a-zA-Z0-9/_\-]*)['"]/gi,
+    /["'](\/backup[a-zA-Z0-9/_\-]*)['"]/gi,
+    /["'](\/private[a-zA-Z0-9/_\-]*)['"]/gi,
+    /["'](\/upload[a-zA-Z0-9/_\-]*)['"]/gi,
+    /["'](\/download[a-zA-Z0-9/_\-]*)['"]/gi,
+    /["'](\/\.well-known\/[a-zA-Z0-9/_\-]+)['"]/gi,
+    /["'](\/idp\/[a-zA-Z0-9/_\-]+)['"]/gi,
+    /(?:fetch|axios\.(?:get|post|put|delete|patch)|\$\.ajax|http\.(?:get|post))\s*\(\s*['"]([^'"\n]{4,200})['"]/g,
+    /(?:url|endpoint|path|baseUrl|apiUrl|route|baseURL|apiURL)\s*[:=]\s*['"]([^'"\n]{4,200})['"]/gi,
+  ];
+
+  var URL_PATTERNS = [
+    /["'](https?:\/\/[^\s"'<>]{10,})['"]/g,
+    /["'](wss?:\/\/[^\s"'<>]{10,})['"]/g,
+    /["'](sftp:\/\/[^\s"'<>]{10,})['"]/g,
+    /(https?:\/\/[a-zA-Z0-9.\-]+\.s3[a-zA-Z0-9.\-]*\.amazonaws\.com[^\s"'<>]*)/g,
+    /(https?:\/\/[a-zA-Z0-9.\-]+\.blob\.core\.windows\.net[^\s"'<>]*)/g,
+    /(https?:\/\/storage\.googleapis\.com\/[^\s"'<>]*)/g,
+    /https?:\/\/[a-z0-9\-]+\.firebaseio\.com/g,
+  ];
+
+  var EMAIL_PATTERN  = /([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,6})/g;
+  var FILE_PATTERN   = /["']([a-zA-Z0-9_\/.\-]+\.(?:sql|csv|xlsx|xls|yaml|yml|txt|log|conf|config|cfg|ini|env|bak|backup|old|orig|key|pem|crt|cer|p12|pfx|doc|docx|pdf|zip|tar|gz|rar|7z|sh|bat|ps1|py|rb|pl))["']/gi;
+  var HTTP_METHOD_RX = /(?:method\s*[:=]\s*['"]?(GET|POST|PUT|DELETE|PATCH|HEAD)['"]?|axios\.(get|post|put|delete|patch)\s*\(|\.(?:post|put|delete|patch)\s*\()/gi;
+
+  var NOISE_DOMAINS = ['www.w3.org','schemas.openxmlformats.org','schemas.microsoft.com',
+    'purl.org','purl.oclc.org','openoffice.org','docs.oasis-open.org','ns.adobe.com',
+    'www.xml.org','example.com','test.com','localhost','127.0.0.1','npmjs.org',
+    'registry.npmjs.org','fusioncharts.com','jqwidgets.com','ag-grid.com'];
+  var NOISE_PATH_RX = [
+    /^\.\.\?\//,/^[a-z]{2}(-[a-z]{2})?\.js$/,/^[a-z]{2}(-[a-z]{2})?$/,
+    /^sha\d*$/,/^aes$|^des$|^md5$/,/^\/[A-Z][a-z]+\s/,/^\/[A-Z][a-z]+$/,
+    /^\d+ \d+ R$/,/^xl\//,/^docProps\//,/^_rels\//,/^META-INF\//,
+    /^webpack/,/^zone\.js$/,/^readable-stream\//,/^process\//,/^stream\//,
+    /^buffer$|^events$|^util$|^path$/,/^\+/,/^\$\{/,/^#/,/^\/[a-zA-Z]$/,
+    /^http:\/\/$/,/_ngcontent/,
+  ];
+  var NOISE_URL_EXT      = ['.css','.png','.jpg','.jpeg','.gif','.svg','.woff','.woff2','.ttf','.ico'];
+  var NOISE_FILE_STR     = ['package.json','tsconfig.json','webpack','babel','eslint','prettier',
+    'node_modules','.min.','polyfill','vendor','chunk','bundle'];
+  var FAKE_EMAIL_DOMAINS = ['example.com','test.com','domain.com','placeholder.com'];
+  var NOISE_STRS         = new Set(['http://','https://','zone.js','bn.js','hash.js','md5.js',
+    'sha.js','des.js','asn1.js','elliptic.js','/a','/P','/R','/V','/W']);
+
+  function isValidEndpoint(v) {
+    if (!v || v.length < 3 || v.length > 250) return false;
+    if (NOISE_STRS.has(v)) return false;
+    for (var i=0; i<NOISE_PATH_RX.length; i++) if (NOISE_PATH_RX[i].test(v)) return false;
+    if (!v.startsWith('/') && !v.startsWith('http')) return false;
+    var parts = v.split('/');
+    if (parts.length < 2 || parts.every(function(p) { return p.length < 2; })) return false;
+    if (/\.(png|jpg|gif|svg|ico|woff|ttf|css|map|txt)$/i.test(v)) return false;
+    return true;
+  }
+
+  function isValidUrl(v) {
+    if (!v || v.length < 15) return false;
+    var vl = v.toLowerCase();
+    for (var i=0; i<NOISE_DOMAINS.length; i++) if (vl.indexOf(NOISE_DOMAINS[i])>-1) return false;
+    if (v.indexOf('{')>-1 || vl.indexOf('undefined')>-1 || vl.indexOf('null')>-1) return false;
+    if (vl.startsWith('data:')) return false;
+    for (var j=0; j<NOISE_URL_EXT.length; j++) if (vl.endsWith(NOISE_URL_EXT[j])) return false;
+    return true;
+  }
+
+  function isValidSecret(v) {
+    if (!v || v.length < 8) return false;
+    var vl = v.toLowerCase();
+    return ['example','placeholder','your_','xxxx','test_','dummy','<','xxx'].every(function(x) { return vl.indexOf(x)===-1; });
+  }
+
+  function isValidEmail(v) {
+    if (!v || v.indexOf('@')===-1) return false;
+    var domain = v.split('@').pop().toLowerCase();
+    if (FAKE_EMAIL_DOMAINS.indexOf(domain)>-1) return false;
+    return ['example','placeholder','noreply'].every(function(x) { return v.toLowerCase().indexOf(x)===-1; });
+  }
+
+  function isValidFile(v) {
+    if (!v || v.length < 3) return false;
+    var vl = v.toLowerCase();
+    for (var i=0; i<NOISE_FILE_STR.length; i++) if (vl.indexOf(NOISE_FILE_STR[i])>-1) return false;
+    if (vl.endsWith('.map')) return false;
+    if (vl.endsWith('.json') && v.split('/').pop().length <= 7) return false;
+    return true;
+  }
+
+  function resolveUrlCandidates(ref, baseSrc) {
+    ref = ref.trim();
+    if (!ref || ref.length < 3) return [];
+    var bucket = {};
+    function push(url) {
+      try {
+        url = String(url).split('#')[0];
+        if (url.length > 10 && /\.js(\?[^"']*)?$/i.test(url)) bucket[url] = true;
+      } catch {}
+    }
+    if (/^https?:\/\//i.test(ref)) { push(ref); return Object.keys(bucket); }
+    if (ref.startsWith('//'))       { push(location.protocol + ref); return Object.keys(bucket); }
+    if (ref.startsWith('/'))        { push(location.origin + ref); return Object.keys(bucket); }
+    var baseDir = location.origin + '/', parentDir = location.origin + '/';
+    if (baseSrc && /^https?:/.test(baseSrc)) {
+      var ls = baseSrc.lastIndexOf('/');
+      baseDir = baseSrc.substring(0, ls + 1);
+      var t = baseDir.slice(0, -1), ps = t.lastIndexOf('/');
+      parentDir = ps > baseSrc.indexOf('://') + 2 ? t.substring(0, ps + 1) : baseDir;
+    }
+    var normalized = ref.replace(/^\.\//, '');
+    try { push(new URL(ref, baseDir).href); } catch {}
+    if (parentDir !== baseDir) { try { push(new URL(ref, parentDir).href); } catch {} }
+    var firstSeg = normalized.split('/')[0];
+    var baseDirSegs = baseDir.replace(/\/$/, '').split('/');
+    var lastSeg = baseDirSegs[baseDirSegs.length - 1];
+    if (firstSeg && firstSeg === lastSeg && normalized.indexOf('/') > -1) {
+      var rest = normalized.substring(firstSeg.length + 1);
+      try { push(new URL(rest, baseDir).href); } catch {}
+      if (parentDir !== baseDir) { try { push(new URL(normalized, parentDir).href); } catch {} }
+    }
+    try { push(new URL(normalized, location.origin + '/').href); } catch {}
+    return Object.keys(bucket);
+  }
+
+  function extractJsRefs(code, baseSrc) {
+    var refs = [], seen = {};
+    function add(raw) {
+      resolveUrlCandidates(raw, baseSrc).forEach(function(u) {
+        if (!seen[u]) { seen[u] = true; refs.push(u); }
+      });
+    }
+    var viteM = /__vite__mapDeps\s*=\s*\([^)]*\[([^\]]{1,80000})\]/.exec(code);
+    if (viteM) { var q1=/["']([^"']+\.js(?:\?[^"']*)?)["']/g,m1; while((m1=q1.exec(viteM[1]))!==null) add(m1[1]); }
+    var vmRx=/\{(?:\s*["'][^"']*\.js[^"']*["']\s*:\s*\[[^\]]*\]\s*,?\s*){2,}/g,mm;
+    while((mm=vmRx.exec(code))!==null){ var q2=/["']([^"']+\.js(?:\?[^"']*)?)["']/g,m2; while((m2=q2.exec(mm[0]))!==null) add(m2[1]); }
+    var diRx=/\bimport\s*\(\s*["']([^"']+\.js(?:\?[^"']*)?)["']\s*\)/g,di;
+    while((di=diRx.exec(code))!==null) add(di[1]);
+    var rqRx=/\brequire\s*\(\s*["']([^"']+\.js(?:\?[^"']*)?)["']\s*\)/g,rq;
+    while((rq=rqRx.exec(code))!==null) add(rq[1]);
+    var wpB=/__webpack_require__\.p\s*\+\s*["']([^"']+\.js)/.exec(code);
+    if(wpB){ var ctx=code.substring(Math.max(0,wpB.index-2000),wpB.index+2000);
+      var hmRx=/\{(\d+\s*:\s*["'][a-f0-9]+"(?:\s*,\s*\d+\s*:\s*["'][a-f0-9]+")*)\}/g,hm;
+      while((hm=hmRx.exec(ctx))!==null){ var prRx=/(\d+)\s*:\s*["']([a-f0-9]+)["']/g,pr;
+        while((pr=prRx.exec(hm[1]))!==null) add(wpB[1].replace(/"\s*\+\s*\w+\s*\+\s*"\./,'.'+pr[2]+'.').replace(/chunkId|e\b|id\b/,pr[1])); } }
+    if(/self\[["'][^\]"']+["']\]\s*=\s*self\[["'][^\]"']+["']\]\s*\|\|\s*\[\]/.test(code)){
+      var cuRx=/["']([^"']*static[^"']*)["']\s*\+\s*(?:\w+\s*\+\s*)?["']\.js["']/g,cu;
+      while((cu=cuRx.exec(code))!==null) add(cu[1].replace(/\\/g,'')+'.js'); }
+    var alRx=/\[(\s*["'][^"']+\.js["'](?:\s*,\s*["'][^"']+\.js["']){2,}\s*)\]/g,al;
+    while((al=alRx.exec(code))!==null){ var q7=/["']([^"']+\.js(?:\?[^"']*)?)["']/g,m7; while((m7=q7.exec(al[1]))!==null) add(m7[1]); }
+    var plRx=/["'](\.[/][^"']+\.js(?:\?[^"']*)?)["']/g,pl;
+    while((pl=plRx.exec(code))!==null) add(pl[1]);
+    var stRx=/src\s*=\s*["']([^"']+\.js(?:\?[^"']*)?)["']/g,st;
+    while((st=stRx.exec(code))!==null) add(st[1]);
+    return refs;
+  }
+
+  function etld1(hostname) {
+    var parts = hostname.split('.');
+    return parts.length >= 2 ? parts.slice(-2).join('.') : hostname;
+  }
+
+  function credentialsFor(url) {
+    try {
+      var h = new URL(url).hostname;
+      if (h === location.hostname) return 'include';
+      if (etld1(h) === etld1(location.hostname)) return 'include';
+      return 'omit';
+    } catch { return 'omit'; }
+  }
+
+  var _inFlight  = 0;
+  var _fetchPool = [];
+
+  function _drainPool() {
+    while (_fetchPool.length > 0 && _inFlight < CFG.FETCH_CONCUR) {
+      var item = _fetchPool.shift();
+      _inFlight++;
+      var ac      = new AbortController();
+      var timer   = setTimeout(function() { ac.abort(); }, CFG.FETCH_TIMEOUT_MS);
+      var opts    = Object.assign({}, item.opts, { signal: ac.signal });
+      _origFetch(item.url, opts)
+        .then(function(res)  { clearTimeout(timer); _inFlight--; item.resolve(res); _drainPool(); })
+        .catch(function(err) { clearTimeout(timer); _inFlight--; item.reject(err);  _drainPool(); });
+    }
+  }
+
+  function throttledFetch(url, opts) {
+    return new Promise(function(resolve, reject) {
+      _fetchPool.push({ url:url, opts:opts||{}, resolve:resolve, reject:reject });
+      _drainPool();
+    });
+  }
+
+  async function fetchJs(url) {
+    try {
+      var r = await throttledFetch(url, { credentials: credentialsFor(url) });
+      if (r.ok) {
+        var deob = deobfuscate(await r.text());
+        return { scan: deob.scan, raw: deob.raw, blocked: false };
+      }
+    } catch {}
+    try {
+      await throttledFetch(url, { mode:'no-cors' });
+      return { scan: null, raw: null, blocked: true };
+    } catch {}
+    return null;
+  }
+
+  function extractBundlerChunks() {
+    var chunks = [];
+    try {
+      var wm = window.__webpack_modules__;
+      if (wm) Object.keys(wm).slice(0, 80).forEach(function(k) {
+        try { if (typeof wm[k]==='function') {
+          var deob = deobfuscate(wm[k].toString().substring(0, 80000));
+          chunks.push({ origin:'webpack', src:'webpack:module:'+k, scan:deob.scan, raw:deob.raw, depth:0 });
+        }} catch {}
+      });
+    } catch {}
+    try {
+      var wc = window.webpackChunk || window.webpackChunkbuild;
+      if (Array.isArray(wc)) wc.forEach(function(chunk, i) {
+        try { Object.values(chunk[1]||{}).forEach(function(m) {
+          if (typeof m==='function') {
+            var deob = deobfuscate(m.toString().substring(0, 80000));
+            chunks.push({ origin:'webpack-chunk', src:'webpack:chunk:'+i, scan:deob.scan, raw:deob.raw, depth:0 });
+          }
+        }); } catch {}
+      });
+    } catch {}
+    return chunks;
+  }
+
+  var blocks       = [];
+  var visited      = {};
+  var corsBlocked  = [];
+  var storageMap   = {};
+  var includeEdges = {};
+  var bfsAborted   = false;
+
+  var seedUrls = [];
+  for (var _el of document.scripts) {
+    if (_el.src) {
+      if (!visited[_el.src]) { visited[_el.src]=true; seedUrls.push(_el.src); }
+      try {
+        var _u=new URL(_el.src), _p=_u.pathname.split('/').filter(Boolean); _p.pop();
+        var _k=_u.origin+'/'+_p.join('/')+'/';
+        storageMap[_k]=(storageMap[_k]||0)+1;
+      } catch {}
+    } else if (_el.textContent && _el.textContent.trim()) {
+      var _deob = deobfuscate(_el.textContent);
+      blocks.push({ origin:'inline', src:'(inline)', depth:0,
+                    scan:_deob.scan, raw:_deob.raw, obfuscated:false });
+    }
+  }
+
+  var bundlerChunks = extractBundlerChunks();
+  blocks.push.apply(blocks, bundlerChunks);
+
+  var bfsQueue = seedUrls.map(function(u) { return { url:u, depth:0, parent:'(seed)' }; });
+
+  bundlerChunks.forEach(function(bc) {
+    extractJsRefs(bc.scan, location.href).forEach(function(url) {
+      if (!visited[url]) { visited[url]=true; bfsQueue.push({ url:url, depth:1, parent:bc.src }); }
+    });
+  });
+
+  var _visitedCount = Object.keys(visited).length;
+
+  while (bfsQueue.length > 0) {
+    var _item = bfsQueue.shift();
+    var _res  = await fetchJs(_item.url);
+
+    if (!_res) continue;
+
+    if (_res.blocked) {
+      corsBlocked.push({ url:_item.url, parent:_item.parent, depth:_item.depth });
+      continue;
+    }
+
+    if (_item.parent !== '(seed)') {
+      if (!includeEdges[_item.parent]) includeEdges[_item.parent] = [];
+      includeEdges[_item.parent].push(_item.url);
+    }
+
+    var _isOb = isObfuscated(_res.raw || '');
+    blocks.push({ origin: _item.depth===0?'external':'include', src:_item.url,
+                  depth:_item.depth, scan:_res.scan, raw:_res.raw, obfuscated:_isOb });
+
+    try {
+      var _ui=new URL(_item.url), _pi=_ui.pathname.split('/').filter(Boolean); _pi.pop();
+      var _ki=_ui.origin+'/'+_pi.join('/')+'/';
+      storageMap[_ki]=(storageMap[_ki]||0)+1;
+    } catch {}
+
+    if (_item.depth < CFG.INCLUDE_DEPTH) {
+      if (_visitedCount >= CFG.BFS_BRAKE) {
+        if (!bfsAborted) {
+          bfsAborted = true;
+          console.warn('[WebSecScanner] BFS brake fired at ' + CFG.BFS_BRAKE +
+            ' unique URLs. Remaining queue items will still be processed but no new children queued.');
+        }
+      } else {
+        extractJsRefs(_res.scan, _item.url).forEach(function(childUrl) {
+          if (!visited[childUrl]) {
+            visited[childUrl]=true;
+            _visitedCount++;
+            bfsQueue.push({ url:childUrl, depth:_item.depth+1, parent:_item.url });
+          }
+        });
+      }
+    }
+  }
+
+  var epMap        = {};
+  var urlSet       = {};
+  var emailSet     = {};
+  var fileSet      = {};
+  var paramSet     = {};
+  var sinkList     = [];
+  var secretList   = [];
+  var seenSecrets  = {};
+  var obfuscatedFiles = [];
+
+  for (var _bi=0; _bi<blocks.length; _bi++) {
+    var blk  = blocks[_bi];
+    var code = blk.scan;
+    var bsrc = blk.src;
+
+    if (blk.obfuscated) obfuscatedFiles.push(bsrc);
+    if (!code) continue;
+
+    for (var _pi=0; _pi<ENDPOINT_PATTERNS.length; _pi++) {
+      var epRx=new RegExp(ENDPOINT_PATTERNS[_pi].source, ENDPOINT_PATTERNS[_pi].flags), _em;
+      while((_em=epRx.exec(code))!==null) {
+        var raw=(_em[1]||_em[0]).replace(/['" ]/g,'').split('?')[0].trim();
+        if (!isValidEndpoint(raw)) continue;
+        var ctxS=code.substring(Math.max(0,_em.index-80),_em.index+140);
+        var methods=[], mRx=new RegExp(HTTP_METHOD_RX.source,'gi'), mc;
+        while((mc=mRx.exec(ctxS))!==null){ var mt=(mc[1]||mc[2]||'').toUpperCase(); if(mt&&methods.indexOf(mt)===-1) methods.push(mt); }
+        if(!methods.length){
+          if(/\.post\s*\(/i.test(ctxS)) methods.push('POST');
+          else if(/\.put\s*\(/i.test(ctxS)) methods.push('PUT');
+          else if(/\.delete\s*\(/i.test(ctxS)) methods.push('DELETE');
+          else if(/\.patch\s*\(/i.test(ctxS)) methods.push('PATCH');
+          else methods.push('GET');
+        }
+        if(epMap[raw]) { methods.forEach(function(m){ if(epMap[raw].methods.indexOf(m)===-1) epMap[raw].methods.push(m); }); }
+        else epMap[raw]={ path:raw, methods:methods, source:bsrc };
+      }
+    }
+
+    for (var _ui2=0; _ui2<URL_PATTERNS.length; _ui2++) {
+      var uRx=new RegExp(URL_PATTERNS[_ui2].source,URL_PATTERNS[_ui2].flags), um;
+      while((um=uRx.exec(code))!==null){ var uv=(um[1]||um[0]).trim(); if(isValidUrl(uv)&&!urlSet[uv]) urlSet[uv]={url:uv,source:bsrc}; }
+    }
+
+    for (var _si=0; _si<SECRET_PATTERNS.length; _si++) {
+      var sp=SECRET_PATTERNS[_si], srx=new RegExp(sp.rx.source,sp.rx.flags), sm;
+      while((sm=srx.exec(code))!==null){
+        var sv=(sm[1]||sm[0]).trim();
+        if(!isValidSecret(sv)) continue;
+        if(sp.name==='Generic High-Entropy Key'&&!isHighEntropy(sv)) continue;
+        var sk=sp.name+':'+sv;
+        if(!seenSecrets[sk]){
+          seenSecrets[sk]=bsrc;
+          secretList.push({ type:sp.name, severity:sp.sev, score:sp.score,
+                            value:sv.substring(0,120), entropy:+shannonEntropy(sv).toFixed(2), source:bsrc });
+        }
+      }
+    }
+
+    var erx=new RegExp(EMAIL_PATTERN.source,EMAIL_PATTERN.flags), em2;
+    while((em2=erx.exec(code))!==null){ var ev=em2[1].trim(); if(isValidEmail(ev)&&!emailSet[ev]) emailSet[ev]={email:ev,source:bsrc}; }
+
+    var frx=new RegExp(FILE_PATTERN.source,FILE_PATTERN.flags), fm;
+    while((fm=frx.exec(code))!==null){ var fv=fm[1].trim(); if(isValidFile(fv)&&!fileSet[fv]) fileSet[fv]={file:fv,source:bsrc}; }
+
+    var ppRxs=[
+      /(?:params|data|body|payload|formData|qs)\s*[:=]\s*\{([^}]{1,600})\}/gi,
+      /URLSearchParams[^.]*\.(?:append|set)\s*\(\s*['"]([^'"]+)['"]/gi,
+      /[?&]([a-zA-Z_][a-zA-Z0-9_]{1,40})=/g,
+    ];
+    for(var _ppi=0; _ppi<ppRxs.length; _ppi++){
+      var prx=new RegExp(ppRxs[_ppi].source,ppRxs[_ppi].flags), pm;
+      while((pm=prx.exec(code))!==null){
+        var blkStr=pm[1]||'', krx=/['"]?([a-zA-Z_][a-zA-Z0-9_]{1,40})['"]?\s*:/g, km;
+        while((km=krx.exec(blkStr))!==null){ if(km[1]&&km[1].length>1) paramSet[km[1]]=1; }
+        if(pm[1]&&blkStr.indexOf(':')===-1) paramSet[pm[1]]=1;
+      }
+    }
+
+    for(var _xi=0; _xi<SINK_PATTERNS.length; _xi++){
+      var xp=SINK_PATTERNS[_xi], xrx=new RegExp(xp.rx.source,xp.rx.flags), xm;
+      while((xm=xrx.exec(code))!==null){
+        if(!sinkContextOk(code, xm.index)) continue;
+        var xctx=code.substring(Math.max(0,xm.index-30),xm.index+80).replace(/\n/g,' ').trim();
+        var th=taintHint(code, xm.index);
+        sinkList.push({ sink:xp.sink, risk:xp.risk, score:xp.score,
+                        context:xctx.substring(0,160), taint:th, source:bsrc });
+      }
+    }
+  }
+
+  var SENSITIVE_RX=[
+    {label:'Admin Panel',      rx:/\/admin(?:\/|$|\?)/i},
+    {label:'Dev / Debug',      rx:/\/(?:dev|debug|test|staging|sandbox)(?:\/|$|\?)/i},
+    {label:'Config',           rx:/\/(?:config|settings|setup|preferences)(?:\/|$|\?)/i},
+    {label:'API v2+',          rx:/\/v[2-9]\d*(?:\/|$|\?)/i},
+    {label:'Auth / SSO',       rx:/\/(?:auth|login|logout|oauth|sso|saml|token|mfa)(?:\/|$|\?)/i},
+    {label:'Internal',         rx:/\/(?:internal|private|restricted|hidden|secret)(?:\/|$|\?)/i},
+    {label:'Backup / Export',  rx:/\/(?:backup|restore|export|dump|import)(?:\/|$|\?)/i},
+    {label:'API Docs',         rx:/\/(?:swagger|openapi|api-docs?|graphiql|playground)(?:\/|$|\?)/i},
+    {label:'Health / Metrics', rx:/\/(?:health|status|ping|metrics|actuator|ready|live)(?:\/|$|\?)/i},
+    {label:'Webhook',          rx:/\/(?:webhook|callback|hook|trigger|notify)(?:\/|$|\?)/i},
+    {label:'GraphQL',          rx:/\/(?:graphql|gql)(?:\/|$|\?)/i},
+    {label:'Payment',          rx:/\/(?:payment|billing|checkout|invoice|charge|refund)(?:\/|$|\?)/i},
+    {label:'File Upload',      rx:/\/(?:upload|file|media|blob|storage)(?:\/|$|\?)/i},
+    {label:'User Management',  rx:/\/(?:users?|accounts?|members?|roles?|permissions?)(?:\/|$|\?)/i},
+    {label:'Env / Key File',   rx:/\.env|secrets?\.|credentials?\.|\.(pem|key|cert)$/i},
+  ];
+
+  var allEndpoints=Object.values(epMap), sensitiveEndpoints=[];
+  allEndpoints.forEach(function(ep){
+    for(var i=0;i<SENSITIVE_RX.length;i++){
+      if(SENSITIVE_RX[i].rx.test(ep.path)){ sensitiveEndpoints.push(Object.assign({},ep,{category:SENSITIVE_RX[i].label})); break; }
+    }
+  });
+
+  var STORE_RX=[
+    {name:'JWT',          rx:/^ey[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$/},
+    {name:'Firebase Key', rx:/^AIza[0-9A-Za-z\-_]{35}$/},
+    {name:'Stripe Key',   rx:/^(?:pk|sk)_(?:live|test)_[0-9a-zA-Z]{24,}$/},
+    {name:'Generic Key',  rx:/^[A-Za-z0-9\-_]{32,128}$/},
+  ];
+
+  var storageFindings=[];
+  function auditStore(store, label){
+    try{
+      for(var i=0;i<store.length;i++){
+        var k=store.key(i), v=store.getItem(k); if(!v) continue;
+        STORE_RX.forEach(function(p){
+          if(p.rx.test(v.trim())){
+            if(p.name==='Generic Key'&&!isHighEntropy(v.trim())) return;
+            storageFindings.push({store:label,key:k,value:v.substring(0,120),type:p.name,entropy:+shannonEntropy(v.trim()).toFixed(2)});
+          }
+        });
+        try{ var flat=JSON.stringify(JSON.parse(v));
+          STORE_RX.forEach(function(p){ if(p.rx.test(flat)) storageFindings.push({store:label,key:k,value:'[JSON]'+flat.substring(0,100),type:'JSON:'+p.name,entropy:0}); });
+        }catch{}
+      }
+    }catch{}
+  }
+  auditStore(localStorage,  'localStorage');
+  auditStore(sessionStorage,'sessionStorage');
+
+  var cookieFindings=[];
+  var SENS_COOK=/session|auth|token|jwt|access|refresh|csrf|xsrf|key|secret/i;
+  try{
+    document.cookie.split(';').forEach(function(c){
+      var parts=c.trim().split('='), cname=parts[0].trim(), cval=parts.slice(1).join('=').trim();
+      if(!cval) return;
+      var ce=shannonEntropy(cval);
+      if(SENS_COOK.test(cname)||ce>3.5) cookieFindings.push({name:cname,value:cval.substring(0,100),entropy:+ce.toFixed(2)});
+    });
+  }catch{}
+
+  var _dynStart=Date.now(), _lastCount=_live.length;
+  await new Promise(function(resolve){
+    setTimeout(function(){
+      var hard=setTimeout(resolve, CFG.DYN_MAX_MS-CFG.DYN_MIN_MS);
+      var tick=setInterval(function(){
+        if(_live.length===_lastCount){ clearInterval(tick); clearTimeout(hard); resolve(); }
+        _lastCount=_live.length;
+      }, CFG.DYN_IDLE_MS);
+    }, CFG.DYN_MIN_MS);
+  });
+
+  var dynSeen={}, dynamicDeduped=[];
+  _live.forEach(function(r){ var k=r.method+'::'+r.url; if(!dynSeen[k]){dynSeen[k]=true;dynamicDeduped.push(r);} });
+
+  var sinkSummary={};
+  sinkList.forEach(function(s){
+    if(!sinkSummary[s.sink]) sinkSummary[s.sink]={count:0,risk:s.risk,taintedCount:0,examples:[]};
+    sinkSummary[s.sink].count++;
+    if(s.taint==='tainted') sinkSummary[s.sink].taintedCount++;
+    if(sinkSummary[s.sink].examples.length<3) sinkSummary[s.sink].examples.push({context:s.context,taint:s.taint});
+  });
+
+  var secretScore = secretList.reduce(function(s,x){return s+x.score;},0);
+  var sinkScore   = sinkList.reduce(function(s,x){
+    var mult = x.taint==='tainted' ? 1.0 : x.taint==='static' ? 0.1 : 0.5;
+    return s + x.score * mult;
+  }, 0);
+  var storeScore  = storageFindings.length*20 + cookieFindings.length*5;
+  var epScore     = sensitiveEndpoints.length*5;
+  var riskScore   = Math.min(100, Math.round(secretScore + sinkScore + storeScore + epScore));
+
+  var REMEDIATION={
+    'CRITICAL':'Rotate/revoke immediately. Treat as fully compromised. Check CloudTrail/audit logs for abuse.',
+    'HIGH':'Revoke and reissue token. Audit recent API usage for anomalies.',
+    'MEDIUM':'Rotate key. Restrict to needed scopes. Move to server-side or environment variable.',
+    'LOW':'Review and confirm if real credential. Move secrets out of client-side code.',
+  };
+
+  function groupBySev(list){ var g={CRITICAL:[],HIGH:[],MEDIUM:[],LOW:[]}; list.forEach(function(s){(g[s.severity]||g.LOW).push(s);}); return g; }
+
+  var allEndpointsSorted=allEndpoints.sort(function(a,b){return a.path<b.path?-1:1;});
+  var allUrls=Object.values(urlSet), allEmails=Object.values(emailSet),
+      allFiles=Object.values(fileSet), allParams=Object.keys(paramSet).sort();
+
+  var report = {
+    meta: {
+      tool:'WebSec Scanner v5.1',
+      target:location.href, origin:location.origin,
+      scanDate:new Date().toISOString(), userAgent:navigator.userAgent,
+      config: CFG,
+      scriptStats:{
+        seedScriptTags: seedUrls.length,
+        inlineBlocks:   blocks.filter(function(b){return b.origin==='inline';}).length,
+        externalFetched:blocks.filter(function(b){return b.origin==='external';}).length,
+        includesFetched:blocks.filter(function(b){return b.origin==='include';}).length,
+        bundlerChunks:  blocks.filter(function(b){return b.origin==='webpack'||b.origin==='webpack-chunk';}).length,
+        corsBlocked:    corsBlocked.length,
+        totalBlocks:    blocks.length,
+        obfuscatedFiles:obfuscatedFiles.length,
+        bfsAborted:     bfsAborted,
+        uniqueUrlsVisited: _visitedCount,
+      },
+    },
+
+    corsBlocked:{
+      note:'CORS-blocked scripts could NOT be scanned — manual review required.',
+      items:corsBlocked,
+    },
+
+    obfuscatedFiles:{
+      note:'Deobfuscation attempted (multi-pass string-array + base64). Coverage may be incomplete.',
+      items:obfuscatedFiles,
+    },
+
+    includeGraph:{
+      note:'JS files discovered via __vite__mapDeps / import() / require() / webpack manifests',
+      discoveredIncludes:blocks.filter(function(b){return b.origin==='include';}).map(function(b){return{url:b.src,depth:b.depth};}),
+      edges:Object.entries(includeEdges).map(function(kv){return{parent:kv[0],children:kv[1]};}),
+    },
+
+    storagePatterns:Object.entries(storageMap).map(function(kv){
+      var type='Same-Origin';
+      try{
+        var h=new URL(kv[0]).hostname;
+        if(h!==location.hostname) type='CDN / External';
+        else if(kv[0].indexOf('/static/')>-1) type='Static Build';
+        else if(kv[0].indexOf('/assets/')>-1) type='Asset Bundle';
+        else if(kv[0].indexOf('/js/')>-1) type='JS Directory';
+      }catch{}
+      return{pattern:kv[0],type:type,count:kv[1]};
+    }),
+
+    secrets:{
+      total:secretList.length,
+      note:'Cross-source deduplicated. Generic keys gated by charset-aware entropy.',
+      bySeverity:groupBySev(secretList),
+      remediation:REMEDIATION,
+      items:secretList,
+    },
+
+    xssSinks:{
+      total:sinkList.length,
+      taintedCount:sinkList.filter(function(s){return s.taint==='tainted';}).length,
+      note:'taint=tainted means user-controlled source detected nearby. taint=static likely safe. taint=unknown needs manual review.',
+      summary:sinkSummary,
+      items:sinkList,
+    },
+
+    endpoints:{ total:allEndpointsSorted.length, items:allEndpointsSorted },
+    sensitiveEndpoints:{ total:sensitiveEndpoints.length, items:sensitiveEndpoints },
+
+    dynamicRequests:{
+      total:dynamicDeduped.length,
+      captureMs:Date.now()-_dynStart,
+      note:'Captured until network idle ('+CFG.DYN_IDLE_MS+'ms) or '+CFG.DYN_MAX_MS+'ms max.',
+      items:dynamicDeduped,
+    },
+
+    parameters:{total:allParams.length,items:allParams},
+    urls:{total:allUrls.length,items:allUrls},
+    emails:{total:allEmails.length,items:allEmails},
+    sensitiveFiles:{total:allFiles.length,items:allFiles},
+
+    browserStorage:{
+      localStorageFindings:  storageFindings.filter(function(f){return f.store==='localStorage';}),
+      sessionStorageFindings:storageFindings.filter(function(f){return f.store==='sessionStorage';}),
+      cookieFindings:cookieFindings,
+    },
+
+    summary:{
+      riskScore:riskScore,
+      riskLevel:riskScore>=70?'CRITICAL':riskScore>=40?'HIGH':riskScore>=20?'MEDIUM':'LOW',
+      scoreBreakdown:{ secrets:secretScore, sinks:Math.round(sinkScore), storage:storeScore, endpoints:epScore },
+      warnings:[
+        bfsAborted ? '[WARN] BFS brake fired at '+CFG.BFS_BRAKE+' URLs — increase CFG.BFS_BRAKE if target is unusually large' : null,
+        obfuscatedFiles.length ? '[WARN] '+obfuscatedFiles.length+' obfuscated file(s) — partial coverage only' : null,
+        corsBlocked.length ? '[MANUAL] '+corsBlocked.length+' CORS-blocked script(s) — manual review needed' : null,
+      ].filter(Boolean),
+      findings:[
+        secretList.filter(function(s){return s.severity==='CRITICAL';}).length ? '[CRITICAL] '+secretList.filter(function(s){return s.severity==='CRITICAL';}).length+' critical secret(s) — rotate immediately' : null,
+        secretList.filter(function(s){return s.severity==='HIGH';}).length ? '[HIGH] '+secretList.filter(function(s){return s.severity==='HIGH';}).length+' high-severity secret(s)' : null,
+        secretList.filter(function(s){return s.severity==='MEDIUM';}).length ? '[MEDIUM] '+secretList.filter(function(s){return s.severity==='MEDIUM';}).length+' medium-severity secret(s)' : null,
+        storageFindings.length ? '[HIGH] '+storageFindings.length+' secret(s) in localStorage/sessionStorage' : null,
+        cookieFindings.length ? '[MEDIUM] '+cookieFindings.length+' sensitive cookie(s)' : null,
+        sinkList.filter(function(s){return s.risk==='CRITICAL'&&s.taint==='tainted';}).length ? '[CRITICAL] '+sinkList.filter(function(s){return s.risk==='CRITICAL'&&s.taint==='tainted';}).length+' tainted CRITICAL DOM sink(s)' : null,
+        sinkList.filter(function(s){return s.risk==='HIGH'&&s.taint==='tainted';}).length ? '[HIGH] '+sinkList.filter(function(s){return s.risk==='HIGH'&&s.taint==='tainted';}).length+' tainted HIGH-risk DOM sink(s)' : null,
+        sinkList.filter(function(s){return s.taint==='unknown';}).length ? '[REVIEW] '+sinkList.filter(function(s){return s.taint==='unknown';}).length+' sink(s) with unknown taint — manual check needed' : null,
+        sensitiveEndpoints.length ? '[INFO] '+sensitiveEndpoints.length+' sensitive endpoint(s)' : null,
+        dynamicDeduped.length ? '[INFO] '+dynamicDeduped.length+' live request(s) captured' : null,
+        allEndpoints.length ? '[INFO] '+allEndpoints.length+' endpoint(s) mapped (static)' : null,
+      ].filter(Boolean),
+    },
+  };
+
+  try{
+    var blob=new Blob([JSON.stringify(report,null,2)],{type:'application/json'});
+    var dlURL=URL.createObjectURL(blob);
+    var a=Object.assign(document.createElement('a'),{href:dlURL,download:'results_scan_'+location.hostname+'_'+Date.now()+'.json'});
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function(){URL.revokeObjectURL(dlURL);},15000);
+  }catch(e){ console.warn('[WebSecScanner] Blob blocked — use window.__wsReport'); }
+
+  window.__wsReport=report;
+  console.log('%c[WebSec Scanner] v5.1', 'font-weight:bold;color:#e91e63');
+  console.log('%cRisk Score: ' + riskScore + '/100 [' + report.summary.riskLevel + ']', 'font-size:14px;font-weight:bold;color:' + (riskScore>=70?'#f44336':riskScore>=40?'#ff9800':riskScore>=20?'#ffeb3b':'#4caf50'));
+  console.log('%cBlocks: ' + blocks.length + ' | Visited: ' + _visitedCount + (bfsAborted?' (BRAKE FIRED)':''), 'color:#2196f3');
+  console.log('%cFull report: window.__wsReport', 'color:#9c27b0');
+  console.log('%cRestore patches: window.__wsRestore()', 'color:#607d8b');
+  console.table && console.table(report.summary.findings.map(function(f){return{finding:f};}));
+
+  return report;
+})();

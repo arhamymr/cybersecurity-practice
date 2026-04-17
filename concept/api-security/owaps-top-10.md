@@ -238,6 +238,7 @@ Semua outbound request lewat kontrol
 Kesalahan setting yang membuat endpoint API menjadi terlalu terbuka, contoh:
 - Tidak ada Rate Limit
 - Patch Keamanan belum diperbarui
+- Tidak ada TLS (Transport Layer Security)
 - misconfigurasi pada api response api terlalu detail 
 
   ```
@@ -261,3 +262,25 @@ Website lain bisa akses API pakai session user
   tidak ada Authentication
 
 
+## IMPROPER INVENTORY MANAGEMENT
+
+Kerentanan ini terjadi karena organisasi tidak punya daftar yang jelas dan terkelola dengan baik tentang semua API yang mereka miliki
+
+Sehingga:
+
+- Ada API yang "terlupakan"
+- Ada versi lama (deprecated) masih aktif
+- Ada endpoint yang tidak terdokumentasi (shadow API)
+
+# Cara Mencegah 
+- Inventory semua API
+- Versioning yang jelas, v1, v2, v3 dan hapus versi lama 
+- Monitoring & logging, track semua endpoint yang diakses
+- Gunakan API Gateway
+- Security testing rutin, VAPT/Scanning
+
+## UNSAFE CONSUMPTION of APIs
+
+Kerentanan ini dapat terjadi jika sistem kamu percaya begitu saja pada API lain (third-party/external API) tanpa validasi atau kontrol yang cukup, jadi bukan API kamu yang diserang langsung tapi API yang dikonsumsi menjadi titik lemah
+
+Contoh 
