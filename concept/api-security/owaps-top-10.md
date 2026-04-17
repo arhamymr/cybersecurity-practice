@@ -143,3 +143,38 @@ User bisa jadi **Admin**
 
 Kerentanan ketika aplikasi tidak membatasi penggunaan resource (CPU, RAM, Bandwith, disk, atau API Calls), sehingga attacker bisa "menguras" resource sampai sistem jadi lambat atau bahkan down
 
+Contohnya ada api yang tidak membatasi jumlah inputan yang masuk ke server, Peretas bisa mengirim payload/query berat yang bisa membuat server memproses data terlalu besar sehingga bisa membuat server crash atau tidak bisa melayani pengguna lain 
+
+### Cara Mencegah
+
+- **Rate Limit** batasi request per IP/user, contoh 100 request/menit
+- **Input Validation** batasi ukuran file, panjang input , jika api berbentuk pagination validation batasi maksimal data yang bisa di request, contohnya 100 data per request 
+- **Timeout / Trottling** hentikan proses yang terlalu lama
+- **Caching** Kurangi beban server 
+- **User Type Rate Limit** Setiap type user punya reate limit yang berbeda contohnya type pengguna `guest` dan `registered` mempunyai rate limit yang berbeda, type `registered` memiliki limit yang lebih besar karena sudah teridentifikasi dibanding type `guest`
+
+## UNRESTRICTED ACCESS TO SENSITIVE BUSINESS FLOWS
+
+Kerentanan ketika alur bisnis penting (Business Logic) bisa diakses oleh siapa saja tanpa kontrol yang tepat, aksi tersebut tidak dilindungi
+
+Sensitive business flow contohnya seperti 
+- Pembayaran
+- Refund
+- Transfer Uang 
+- Reset Password 
+- Upgrade Akun 
+- Verifikasi identitas
+- Order / Checkout
+
+Contohnya e-commerce yang memiliki fitur refund uang, namun karena ada bug user biasa (unauthorized) bisa akses endpoint refund 
+
+### Cara Mencegah 
+
+- **Access Control (RBAC/ABAC)**
+  
+  Implementasi Role Base Access Control/Attribute Base Access Control untuk semua endpoint, pastikan setiap request selalu ada pengecekan cek role sebelum di proses ke tahap selanjutnya 
+- **Validasi dan Authorization Backend**
+  
+  Validasi setiap request dan lakukan pengecekan authorization setiap request 
+
+
