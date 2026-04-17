@@ -7,6 +7,25 @@
 - [Broken Object Property Level Authorization (BOPLA)](#broken-object-propery-level-authorization-bopla)
 - [Unrestricted Resource Consumption](#unrestricted-resource-consuption)
 - [Unrestricted Access to Sensitive Business Flows](#unrestricted-access-to-sensitive-business-flows)
+- [Server Side Request Forgery](#server-side-request-forgery)
+- [Server Misconfiguration](#server-misconfiguration)
+
+## Prevention Methods
+
+- [BOLA Prevention](#cara-mencegah)
+- [Broken Authentication Prevention](#cara-mencegah-1)
+- [BOPLA Prevention](#cara-mencegah-2)
+- [Resource Consumption Prevention](#cara-mencegah-3)
+- [Business Flows Prevention](#cara-mencegah-4)
+- [SSRF Prevention](#cara-mencegah-5)
+
+## Key Concepts
+
+- [BOLA Dangers](#berbahaya-karena)
+- [BOLA vs BOPLA Difference](#perbedaan-bola-vs-bopla)
+- [Mass Assignment Example](#contoh-lebih-bahaya-mass-assignment)
+- [Sensitive Business Flow Examples](#sensitive-business-flow-contohnya-seperti)
+- [SSRF Simple Example](#contoh-sederhana)
 
 
 
