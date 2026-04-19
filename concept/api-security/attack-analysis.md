@@ -33,9 +33,9 @@ Framework
   Mengurangi dan menghilangkan resiko 
 
 
-## ATTACKER WANT ?
+## ATTACKER WANT (Apa diinginkan oleh attacker) ?
 
-Yang diinginkan oleh attacker biasanya 
+Gunakan ini sebagai hal pertama yang dilakukan ketika melakukan threat modeling  
 
 - Personal Information (PII), 
 - Financial Information: Bangking data, credits cards
